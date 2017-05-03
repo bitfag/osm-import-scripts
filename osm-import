@@ -1,0 +1,69 @@
+#!/bin/sh -e
+
+# some libshell functions from http://git.altlinux.org/people/legion/packages/libshell.git
+
+PROG="${PROG:-${0##*/}}"
+
+message_syslog=
+message_time=
+message_time_format=
+message()
+{
+    local arg= prefix=
+    if [ -n "$message_syslog" ]; then
+        [ ! -t 2 ] || arg=-s
+        logger $arg -t "$PROG" "$*"
+        return
+    fi
+    [ -z "$message_time" ] ||
+        prefix="$(date +"${message_time_format:-[%Y-%m-%d %T]} " 2>/dev/null)" ||:
+    printf %s\\n "${prefix}$PROG: $*" >&2
+}
+
+fatal()
+{
+    message "$@"
+    exit 1
+}
+
+# source config
+if [ -s ./osm-import.conf ]; then
+    . ./osm-import.conf
+elif [ -s /etc/osm-import.conf ]; then
+    . /etc/osm-import.conf
+else
+    fatal "cannot use config file"
+fi
+
+psql="psql -U $PG_USER -h $PG_HOST -p $PG_PORT -d postgres"
+
+# check that we have proper credentials
+# .pgpass should be 600 perms
+# format is "host:port:db:user:pass"
+if ! grep -qs "$PG_HOST" "$HOME/.pgpass"; then
+    fatal "please specify access credentials in ~/.pgpass"
+fi
+
+# download osm data
+[ -f "$LOCAL_DUMP_PATH" ] && rm -f "$LOCAL_DUMP_PATH"
+wget -c "$DUMP_URL" -O "$LOCAL_DUMP_PATH"
+
+# drop temp database if exist
+$psql -c "DROP DATABASE IF EXISTS ${PG_DATABASE}_tmp"
+
+# prepare database
+$psql -c "CREATE DATABASE ${PG_DATABASE}_tmp TEMPLATE=template_postgis"
+psql -U "$PG_USER" -h "$PG_HOST" -p "$PG_PORT" -d "$PG_DATABASE"_tmp -c "CREATE EXTENSION hstore;"
+
+# import data with osm2pgsql
+opts="--create --slim --hstore --drop --cache "$CACHE_SIZE" --number-processes "$NPROC" -U "$PG_USER" -H "$PG_HOST" -P "$PG_PORT" -d "$PG_DATABASE"_tmp"
+[ -n "$OSM2PGSQL_CUSTOM_OPTS" ] && opts="$opts $OSM2PGSQL_CUSTOM_OPTS"
+osm2pgsql $opts "$LOCAL_DUMP_PATH"
+
+# drop old db
+$psql -c "UPDATE pg_database SET datallowconn = 'false' WHERE datname = '$PG_DATABASE'"
+$psql -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname='$PG_DATABASE' AND pid <> pg_backend_pid()"
+$psql -c "DROP DATABASE IF EXISTS $PG_DATABASE"
+
+# rename database
+$psql -c "ALTER DATABASE ${PG_DATABASE}_tmp RENAME TO $PG_DATABASE"
